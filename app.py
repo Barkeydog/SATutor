@@ -1,35 +1,50 @@
 #!/usr/bin/env python3
 """
-OpenSAT Coach — Flask web app
+OpenSAT Coach — Unified App (PDF analyzer + domain detector + quiz)
 
-What it does
-------------
-• Upload a PDF SAT score report (or a test PDF). The app extracts your section scores and errors.
-• Diagnoses priority sections/concepts to focus on.
-• Loads a built-in question bank from `questions.csv` and recommends targeted practice.
-• Runs an interactive quiz; if you miss a question, click “Teach me” to get step‑by‑step guidance via an LLM.
-• Polished UI with Bootstrap + Alpine.js + Chart.js.
+What this script does
+---------------------
+• Upload a SAT score report PDF (College Board Practice Score Report works best).
+  - Extracts section scores (heuristic text approach) and/or
+  - Uses computer vision to detect empty Knowledge & Skills boxes by domain
+    (Information & Ideas, Craft & Structure, etc.) using OpenCV + Tesseract.
+• Computes focus domains from whichever signal is available (vision or text).
+• Loads a question bank (questions.csv) and serves a targeted quiz in the browser.
+• Clean, minimal UI (Bootstrap, Alpine.js, Chart.js + MathJax for math rendering).
 
 Quick start
 -----------
-1) Save this file as `app.py`
-2) (Optional) Create and activate a virtualenv
+1) Save this file as `opensat_coach_full.py`
+2) (Recommended) Create a virtualenv
    python3 -m venv .venv && source .venv/bin/activate
-3) Install deps:
-   pip install flask PyPDF2 pandas transformers accelerate torch
-4) (Optional) Choose a local Hugging Face model (defaults to TinyLlama-1.1B-Chat):
-   export HF_MODEL_ID="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-5) Run it:
-   flask --app app.py --debug run
-6) Open http://127.0.0.1:5000 in your browser.
+3) Install dependencies:
+   pip install flask PyPDF2 pandas opencv-python-headless pytesseract PyMuPDF
+   
+   # If you want to run locally with desktop OpenCV you can also use `opencv-python`.
+   # Ensure Tesseract is installed and on PATH. On Windows, the script will
+   # auto-detect at C:\\Program Files\\Tesseract-OCR\\tesseract.exe if present.
+
+4) (Optional) Put a `questions.csv` in the project root (the app can also accept one via UI).
+5) Run the app:
+   flask --app opensat_coach_full.py --debug run
+6) Open http://127.0.0.1:5000
 
 Notes
 -----
-• Question bank: the app auto-loads `questions.csv` from the project root (or `/mnt/data/questions.csv`). Columns supported (case-insensitive, flexible): id, domain, paragraph, prompt/question, choice_A/choice_B/choice_C/choice_D (or A/B/C/D), correct_answer_letter, correct_answer_text, explanation. Extra columns are preserved.
-• PDF parsing: Best with College Board “Practice Score Report” PDFs. If parsing fails, you can
-  enter scores manually. If you upload a full test PDF (not a score report), use the manual scores
-  form and rely on the question bank for practice.
-• Explanations (local LLM): runs a Hugging Face model locally (≤3B). Set HF_MODEL_ID to pick a model; no external API key needed.
+• Vision detection params can be overridden via `detect_params.json` in the working directory.
+• If CV/ocr detection fails (e.g., missing Tesseract), we fall back to text-only heuristics.
+• This script intentionally avoids remote LLM calls; when an answer is wrong, it shows an
+  "Official Explanation" field from your CSV if present.
+
+CSV format (flexible headers)
+-----------------------------
+- id
+- domain (e.g., Algebra, Advanced Math, Expression of Ideas, etc.)
+- paragraph / passage (optional)
+- prompt / question
+- choice_A / choice_B / choice_C / choice_D (or A/B/C/D)
+- correct_answer_letter / correct_answer_text (either works)
+- explanation (optional)
 
 """
 from __future__ import annotations
@@ -39,65 +54,47 @@ import re
 import io
 import json
 import random
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 
+# --------- Web app deps ---------
 from flask import (
     Flask, request, redirect, url_for, session, flash,
     render_template, jsonify
 )
-
 from jinja2 import DictLoader
-
 import pandas as pd
 from PyPDF2 import PdfReader
+
+# --------- Vision deps ---------
+import cv2
+import fitz  # PyMuPDF
+import numpy as np
+import pytesseract
+from pytesseract import Output
 
 # ---------------------------
 # Config
 # ---------------------------
 SECRET = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
-DEFAULT_QUESTIONS_CSV = os.getenv("QUESTIONS_CSV", "")  # leave blank to upload via UI
+DEFAULT_QUESTIONS_CSV = os.getenv("QUESTIONS_CSV", "")  # if set, preload
 MAX_QUIZ_QUESTIONS = int(os.getenv("MAX_QUIZ_QUESTIONS", "15"))
+PARAMS_FILE = "detect_params.json"
+EXPECTED_PER_DOMAIN = 14  # expected bar boxes per domain
 
-# LLM configuration removed - using official explanations only
+# Optional: auto-path Tesseract on Windows
+if os.name == "nt":
+    t_path = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+    if os.path.exists(t_path):
+        pytesseract.pytesseract.tesseract_cmd = t_path
 
 app = Flask(__name__)
 app.secret_key = SECRET
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ---------------------------
-# CORS for new frontend (Next.js dev server at localhost:3000)
-# ---------------------------
-@app.after_request
-def add_cors_headers(resp):
-    origin = request.headers.get('Origin')
-    # Allow local Next.js and same-origin by default
-    if origin in ("http://localhost:3000", "http://127.0.0.1:3000"):
-        resp.headers['Access-Control-Allow-Origin'] = origin
-        resp.headers['Vary'] = 'Origin'
-        resp.headers['Access-Control-Allow-Credentials'] = 'true'
-    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-    return resp
-
-# Handle CORS preflight for /api/* routes
-@app.route('/api/<path:path>', methods=['OPTIONS'])
-def api_options(path: str):
-    return ('', 204)
-
-# Lightweight API status endpoint for the new frontend
-@app.route('/api/status', methods=['GET'])
-def api_status():
-    return jsonify({
-        'ok': True,
-        'message': 'OpenSAT Coach backend ready',
-        'questions_loaded': len(QB.questions),
-        'max_quiz_questions': MAX_QUIZ_QUESTIONS
-    })
-
-# ---------------------------
-# Templates (DictLoader)
+# UI Templates
 # ---------------------------
 TEMPLATES: Dict[str, str] = {}
 
@@ -107,414 +104,78 @@ TEMPLATES["base.html"] = r"""
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>SATutor</title>
-    <!-- Inter font for a professional, minimalist look -->
+    <title>OpenSAT Coach</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-    <!-- Favicon: mortarboard icon to match header -->
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%230a0a0a'%3E%3Cpath d='M8.211.5a.5.5 0 0 0-.422 0L.5 4l7.289 3.5a.5.5 0 0 0 .422 0L15.5 4 8.211.5z'/%3E%3Cpath d='M.5 5.5v2l7.289 3.5a.5.5 0 0 0 .422 0L13 9.457V12.5a.5.5 0 0 0 .276.447l2 1a.5.5 0 0 0 .724-.447V5.5l-1 .5v6.243l-.724-.362V6L8.5 9 1.5 5.5z'/%3E%3C/svg%3E" />
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
-    
-    <!-- MathJax for math equation rendering -->
+    <!-- MathJax for equations -->
     <script>
       MathJax = {
         tex: {
           inlineMath: [['$', '$'], ['\\(', '\\)']],
           displayMath: [['$$', '$$'], ['\\[', '\\]']],
           processEscapes: true,
-          processEnvironments: true,
-          processRefs: true,
           packages: {'[+]': ['noerrors']}
         },
-        options: {
-          skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre'],
-          processHtmlClass: 'tex2jax_process',
-          ignoreHtmlClass: 'tex2jax_ignore'
-        },
-        loader: {
-          load: ['[tex]/noerrors']
-        },
-        startup: {
-          ready: () => {
-            console.log('MathJax is loaded, but not yet initialized');
-            MathJax.startup.defaultReady();
-            console.log('MathJax is initialized, and the initial typeset is queued');
-          }
-        }
+        loader: { load: ['[tex]/noerrors'] }
       };
     </script>
     <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <style>
-      /* Black & White minimalist tokens (shadcn-esque) */
-      :root {
-        --background: #ffffff;
-        --foreground: #0a0a0a;         /* near-black */
-        --muted: #fafafa;              /* subtle gray */
-        --muted-foreground: #525252;   /* gray-600 */
-        --card: #ffffff;
-        --border: #e5e5e5;             /* gray-200 */
-        --brand: #111111;              /* black as brand */
-        --brand-dark: #000000;
-        --ring: rgba(0,0,0,0.08);      /* focus ring */
-        --radius: 0.5rem;              /* 8px */
-      }
-      
-      html {
-        /* Fluid base font sizing */
-        font-size: clamp(14px, 1.2vw + 0.5rem, 18px);
-      }
-
-      body { 
-        background: var(--muted);
-        color: var(--foreground);
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji", sans-serif;
-        line-height: 1.6;
-        -webkit-font-smoothing: antialiased;
-        -moz-osx-font-smoothing: grayscale;
-      }
-      
-      .navbar { 
-        background: var(--background);
-        border-bottom: 1px solid var(--border);
-        box-shadow: none;
-      }
-      .navbar .container {
-        padding-top: .5rem !important;
-        padding-bottom: .5rem !important;
-      }
-      
-      .brand { 
-        color: var(--foreground); 
-        font-weight: 700; 
-        font-size: clamp(1.1rem, 2.2vw, 1.25rem);
-        letter-spacing: -0.025em; 
-      }
-      
-      .card { 
-        border: 1px solid var(--border);
-        box-shadow: 0 1px 0 rgba(0,0,0,0.04);
-        border-radius: 12px;
-        background: var(--card);
-      }
-      
-      .hero { 
-        background: var(--card);
-        border: 1px solid var(--border);
-        border-radius: 16px;
-        /* Fluid padding so it scales like other sections */
-        padding: clamp(1rem, 3.5vw, 2.5rem) !important;
-      }
-      
-      .btn { border-radius: var(--radius); }
-      .btn-brand { 
-        background: var(--brand); 
-        color: #fff; 
-        border: 1px solid #111;
-        font-weight: 600;
-        padding: clamp(0.45rem, 0.6vw, 0.6rem) clamp(0.8rem, 1.5vw, 1.25rem);
-        transition: background-color .15s ease, border-color .15s ease, color .15s ease;
-      }
-      .btn-brand:hover { 
-        background: var(--brand-dark); 
-        border-color: var(--brand-dark);
-        color: #fff;
-      }
-      /* Ghost buttons: map Bootstrap outline/neutral buttons to ghost style */
-      .btn-ghost,
-      .btn-outline-secondary,
-      .btn-light {
-        background: transparent;
-        color: var(--foreground);
-        border: 1px solid var(--border);
-      }
-      .btn-ghost:hover,
-      .btn-outline-secondary:hover,
-      .btn-light:hover {
-        background: #f5f5f5;
-        border-color: #d4d4d4;
-        color: var(--foreground);
-      }
-      .btn-ghost:active,
-      .btn-outline-secondary:active,
-      .btn-light:active {
-        background: #e5e5e5 !important;
-        border-color: #d4d4d4 !important;
-        color: var(--foreground) !important;
-      }
-      
-      .badge-soft { 
-        background: #f4f4f5; 
-        color: var(--foreground); 
-        border: 1px solid var(--border);
-        font-weight: 500;
-      }
-      
-      .footer { color: #737373; }
-      .form-help { font-size: .9rem; color: var(--muted-foreground); }
-      
-      .domain-chip { 
-        border-radius: 9999px; 
-        padding: .3rem .7rem; 
-        background: #f4f4f5;
-        color: var(--foreground);
-        border: 1px solid var(--border);
-        font-weight: 500;
-        font-size: 0.85rem;
-      }
-
-      /* Alerts: flat, rounded, low-contrast */
-      .alert { 
-        border-radius: 10px;
-        border: 1px solid var(--border);
-        background: #f6f6f6;
-        color: var(--foreground);
-      }
-      .alert-info { background: #f6f6f6; border-color: #e5e5e5; }
-      .alert-success { background: #f6f6f6; border-color: #e5e5e5; }
-      .alert-danger { background: #f6f6f6; border-color: #e5e5e5; }
-
-      /* Form controls */
-      .form-control, .form-select {
-        border-radius: var(--radius);
-        border: 1px solid var(--border);
-        background: var(--background);
-        color: var(--foreground);
-      }
-      .form-control:focus, .form-select:focus {
-        border-color: #d4d4d4;
-        box-shadow: 0 0 0 4px var(--ring);
-        outline: none;
-      }
-      .form-check-input:focus { box-shadow: 0 0 0 4px var(--ring); }
-
-      /* Choices selection in quiz */
-      .choice-option.selected { 
-        background: #fafafa; 
-        border-color: #0a0a0a !important; 
-      }
-      
-      .progress { 
-        height: 8px; 
-        border-radius: 4px;
-        background: #e5e5e5;
-      }
-      .progress-bar {
-        border-radius: 4px;
-        background: #0a0a0a;
-      }
-
-      /* Make all media fluid */
-      img, svg, canvas, video, iframe {
-        max-width: 100%;
-        height: auto;
-      }
-
-      /* Prevent overflow of code/math blocks on small screens */
-      pre, code, mjx-container {
-        max-width: 100%;
-        overflow: auto;
-        white-space: pre-wrap;
-        word-wrap: break-word;
-      }
-      
-      .alert {
-        border-radius: 10px;
-        border: none;
-        font-weight: 500;
-      }
-      
-      .alert-success {
-        background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
-        color: var(--success);
-      }
-      
-      .alert-danger {
-        background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
-        color: var(--danger);
-      }
-      
-      .form-control, .form-select {
-        border-radius: 8px;
-        border: 1px solid #d1d5db;
-        transition: all 0.2s ease;
-      }
-      
-      .form-control:focus, .form-select:focus {
-        border-color: var(--brand);
-        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
-      }
-      
-      .question-content {
-        background: rgba(255, 255, 255, 0.7);
-        border-radius: 12px;
-        padding: clamp(1rem, 2vw, 1.5rem);
-        border: 1px solid rgba(226, 232, 240, 0.8);
-      }
-      
-      .choice-option {
-        background: rgba(255, 255, 255, 0.5);
-        border: 1px solid rgba(226, 232, 240, 0.8);
-        border-radius: 8px;
-        padding: clamp(0.6rem, 1.2vw, 0.9rem);
-        transition: all 0.2s ease;
-      }
-      
-      .choice-option:hover {
-        background: rgba(255, 255, 255, 0.8);
-        border-color: var(--brand);
-      }
-      
-      .choice-option.selected {
-        background: var(--brand-light);
-        border-color: var(--brand);
-      }
-      
-      .explanation-box {
-        background: #ffffff;
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 1.5rem;
-      }
-      
-      /* Math equation styling */
-      .MathJax {
-        font-size: clamp(1em, 1vw + 0.9em, 1.15em) !important;
-      }
-      
-      mjx-container[jax="CHTML"] {
-        line-height: 1.2;
-      }
-
-      /* Scale lead text and hero actions */
-      .lead { font-size: clamp(1rem, 1.1vw, 1.25rem); }
-      .hero .d-flex { flex-wrap: wrap; gap: clamp(0.5rem, 1vw, 0.75rem); }
-
-      /* Fluid heading for hero title */
-      h1.display-6 {
-        font-size: clamp(1.6rem, 3.5vw, 2.5rem);
-      }
-
-      /* General button scaling */
-      .btn {
-        padding: clamp(0.45rem, 0.6vw, 0.6rem) clamp(0.8rem, 1.3vw, 1.1rem);
-        font-size: clamp(0.9rem, 1vw, 1rem);
-      }
-
-      /* Card and hero padding adjustments on smaller screens */
-      @media (max-width: 576px) {
-        .hero { padding: 1rem !important; }
-        .card .p-4, .card.p-4 { padding: 1rem !important; }
-      }
-
-      @media (min-width: 1200px) {
-        .hero { padding: 2rem !important; }
-      }
+      :root { --background:#fff; --foreground:#0a0a0a; --muted:#fafafa; --muted-foreground:#525252; --card:#fff; --border:#e5e5e5; --brand:#111; --brand-dark:#000; --ring:rgba(0,0,0,.08); --radius:.5rem; }
+      body{background:var(--muted);color:var(--foreground);font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+      .navbar{background:var(--background);border-bottom:1px solid var(--border)}
+      .brand{font-weight:700;font-size:1.25rem;letter-spacing:-.025em}
+      .card{border:1px solid var(--border);border-radius:12px;background:var(--card);box-shadow:0 1px 0 rgba(0,0,0,.04)}
+      .hero{background:var(--card);border:1px solid var(--border);border-radius:16px}
+      .btn{border-radius:var(--radius)}
+      .btn-brand{background:var(--brand);color:#fff;border:1px solid #111;font-weight:600}
+      .btn-brand:hover{background:var(--brand-dark);border-color:var(--brand-dark)}
+      .btn-ghost,.btn-outline-secondary,.btn-light{background:transparent;color:var(--foreground);border:1px solid var(--border)}
+      .btn-ghost:hover,.btn-outline-secondary:hover,.btn-light:hover{background:#f5f5f5;border-color:#d4d4d4}
+      .badge-soft{background:#f4f4f5;color:var(--foreground);border:1px solid var(--border);font-weight:500}
+      .domain-chip{border-radius:9999px;padding:.3rem .7rem;background:#f4f4f5;color:var(--foreground);border:1px solid var(--border);font-weight:500;font-size:.85rem}
+      .progress{height:8px;border-radius:4px;background:#e5e5e5}.progress-bar{border-radius:4px;background:#0a0a0a}
+      .question-content{background:#fff;border-radius:12px;padding:1.25rem;border:1px solid #e2e8f0}
+      .choice-option{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:.75rem;transition:all .2s}
+      .choice-option:hover{background:#fafafa;border-color:#111}
+      .choice-option.selected{background:#f5f5f5;border-color:#111}
+      .explanation-box{background:#fff;border:1px solid var(--border);border-radius:12px;padding:1.25rem}
     </style>
   </head>
   <body>
     <nav class="navbar navbar-expand-lg">
       <div class="container py-2">
-        <a class="navbar-brand brand" href="{{ url_for('home') }}"><i class="bi bi-mortarboard"></i> SATutor</a>
+        <a class="navbar-brand brand" href="{{ url_for('home') }}"><i class="bi bi-mortarboard"></i> OpenSAT Coach</a>
+        <div class="ms-auto d-flex gap-2">
+          <a href="{{ url_for('home') }}" class="btn btn-sm btn-outline-secondary">Home</a>
+        </div>
       </div>
     </nav>
-
     <main class="container my-4">
       {% with messages = get_flashed_messages() %}
-        {% if messages %}
-        <div class="alert alert-info">{{ messages[0] }}</div>
-        {% endif %}
+        {% if messages %}<div class="alert alert-info">{{ messages[0] }}</div>{% endif %}
       {% endwith %}
       {% block content %}{% endblock %}
     </main>
-
-  <footer class="container pb-5 footer">
-    <hr>
-    <div class="small d-flex align-items-center gap-2">
-      <span>SATutor &middot; Built with Flask</span>
-      <span class="ms-auto">Official explanations are shown automatically for incorrect answers.</span>
-    </div>
-  </footer>
-
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-  <script>
-    // Enhanced quiz interactions
-    document.addEventListener('DOMContentLoaded', function() {
-      // Add click handlers for choice options
-      document.querySelectorAll('.choice-option').forEach(option => {
-        option.addEventListener('click', function() {
-          const radio = this.querySelector('input[type="radio"]');
-          if (radio) {
-            radio.checked = true;
-            // Remove selected class from all options
-            document.querySelectorAll('.choice-option').forEach(opt => opt.classList.remove('selected'));
-            // Add selected class to clicked option
-            this.classList.add('selected');
-          }
+    <footer class="container pb-5 small text-secondary"><hr>Official explanations are shown automatically for incorrect answers.</footer>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+      document.addEventListener('DOMContentLoaded', function(){
+        document.querySelectorAll('.choice-option').forEach(opt=>{
+          opt.addEventListener('click', function(){
+            const radio = this.querySelector('input[type="radio"]');
+            if(radio){ radio.checked = true; document.querySelectorAll('.choice-option').forEach(x=>x.classList.remove('selected')); this.classList.add('selected'); }
+          });
         });
+        if(window.MathJax){ MathJax.typesetPromise().catch(()=>{}); }
       });
-      
-      // Auto-focus first choice if none selected
-      const firstChoice = document.querySelector('.choice-option input[type="radio"]');
-      if (firstChoice && !document.querySelector('.choice-option input[type="radio"]:checked')) {
-        firstChoice.focus();
-      }
-
-      // Pre-process math expressions in answer choices (safe, idempotent)
-      document.querySelectorAll('.form-check-label').forEach(label => {
-        let html = label.innerHTML;
-        // Split to preserve the leading <strong>A.</strong> part unmodified
-        const parts = html.split('</strong>');
-        if (parts.length > 1) {
-          const lead = parts[0] + '</strong>';
-          let body = parts.slice(1).join('</strong>');
-
-          // Normalize excessive dollar signs to single to avoid $$$ artifacts
-          body = body.replace(/\${2,}/g, '$');
-
-          // Normalize different ways of writing pi to LaTeX token \pi
-          body = body.replace(/\/[Pp][Ii]\b/g, '\\pi');
-          body = body.replace(/\b[Pp][Ii]\b/g, '\\pi');
-
-          // Merge patterns like '5 $...$' or '5$...$' into a single inline math token '$5...$'
-          body = body.replace(/(\b\d+)\s*\$([^$]+)\$/g, function(_, n, inner){ return '$' + n + inner + '$'; });
-          body = body.replace(/(\b\d+)\$([^$]+)\$/g, function(_, n, inner){ return '$' + n + inner + '$'; });
-
-          // Only wrap with math delimiters if there are none already
-          if (!/(\$|\\\(|\\\[)/.test(body)) {
-            // Wrap n\pi as $n\pi$
-            body = body.replace(/(\b\d+)\s*\\pi\b/gi, '$$$1\\pi$');
-            // Wrap standalone \pi as $\pi$
-            body = body.replace(/\\pi\b/gi, '$\\pi$');
-          }
-
-          label.innerHTML = lead + body;
-        }
-      });
-
-      // Render math equations - ensure MathJax processes all content
-      if (window.MathJax) {
-        MathJax.typesetPromise().then(() => {
-          console.log('MathJax rendering complete');
-        }).catch((err) => {
-          console.error('MathJax rendering error:', err);
-        });
-      }
-    });
-    
-    // Function to re-render MathJax when content changes
-    function renderMath() {
-      if (window.MathJax) {
-        MathJax.typesetPromise().catch(function (err) {
-          console.log('MathJax re-render failed: ' + err.message);
-        });
-      }
-    }
-  </script>
+    </script>
   </body>
 </html>
 """
@@ -524,12 +185,46 @@ TEMPLATES["home.html"] = r"""
 {% block content %}
   <div class="p-4 p-lg-5 rounded-4 hero mb-4">
     <div class="row align-items-center">
-      <div class="col-12">
+      <div class="col-lg-7">
         <h1 class="display-6 fw-bold mb-3">Know exactly what to practice next.</h1>
-        <p class="lead text-secondary">Upload your SAT score report PDF. We'll analyze your performance, pinpoint focus areas, and serve the right questions. Get step‑by‑step guidance when you need it.</p>
+        <p class="lead text-secondary">Upload your SAT score report PDF. We'll analyze your performance, detect weak domains visually, and serve the right questions.</p>
         <div class="d-flex gap-2">
           <a href="#upload" class="btn btn-brand btn-lg"><i class="bi bi-upload"></i> Upload PDF</a>
           <a href="{{ url_for('recommend') }}" class="btn btn-outline-secondary btn-lg"><i class="bi bi-graph-up"></i> See recommendations</a>
+        </div>
+      </div>
+      <div class="col-lg-5 mt-4 mt-lg-0">
+        <div class="card p-3">
+          <div class="card-body">
+            <h5 class="fw-bold mb-3">Current Diagnosis</h5>
+            {% if analysis %}
+              <div class="row g-3">
+                <div class="col-12 col-md-6">
+                  <div class="border rounded-3 p-3">
+                    <div class="d-flex justify-content-between mb-1"><strong>Reading & Writing</strong><span>{{ analysis.rw_score or '—' }}</span></div>
+                    <div class="progress"><div class="progress-bar" role="progressbar" style="width: {{ analysis.rw_pct }}%"></div></div>
+                    <div class="mt-2 small text-secondary">Incorrect: {{ analysis.rw_incorrect }}</div>
+                  </div>
+                </div>
+                <div class="col-12 col-md-6">
+                  <div class="border rounded-3 p-3">
+                    <div class="d-flex justify-content-between mb-1"><strong>Math</strong><span>{{ analysis.math_score or '—' }}</span></div>
+                    <div class="progress"><div class="progress-bar" role="progressbar" style="width: {{ analysis.math_pct }}%"></div></div>
+                    <div class="mt-2 small text-secondary">Incorrect: {{ analysis.math_incorrect }}</div>
+                  </div>
+                </div>
+              </div>
+              <div class="mt-3">
+                <strong>Focus areas:</strong>
+                {% for d in analysis.focus_domains %}
+                  <span class="domain-chip me-2">{{ d }}</span>
+                {% endfor %}
+                <div class="mt-3"><a href="{{ url_for('recommend') }}" class="btn btn-brand">See recommendations</a></div>
+              </div>
+            {% else %}
+              <p class="text-secondary">No analysis yet. Upload your PDF to get started.</p>
+            {% endif %}
+          </div>
         </div>
       </div>
     </div>
@@ -539,11 +234,9 @@ TEMPLATES["home.html"] = r"""
     <div class="col-lg-6">
       <div class="card p-4 h-100">
         <h5 class="fw-bold mb-2"><i class="bi bi-filetype-pdf me-2"></i>Upload SAT PDF</h5>
-        <p class="form-help">Best results with College Board Practice Score Reports (PDF). If parsing fails, you can enter scores manually below.</p>
+        <p class="form-help text-secondary">Best results with College Board Practice Score Reports (PDF). If parsing fails, enter scores manually.</p>
         <form class="mt-2" action="{{ url_for('upload_pdf') }}" method="post" enctype="multipart/form-data">
-          <div class="mb-3">
-            <input class="form-control" type="file" name="pdf" accept="application/pdf" required>
-          </div>
+          <div class="mb-3"><input class="form-control" type="file" name="pdf" accept="application/pdf" required></div>
           <button class="btn btn-brand" type="submit">Analyze PDF</button>
         </form>
       </div>
@@ -552,25 +245,11 @@ TEMPLATES["home.html"] = r"""
       <div class="card p-4 h-100">
         <h5 class="fw-bold mb-2"><i class="bi bi-pencil-square me-2"></i>Manual scores (fallback)</h5>
         <form action="{{ url_for('manual_scores') }}" method="post" class="row g-3">
-          <div class="col-6">
-            <label class="form-label">R&W Score</label>
-            <input type="number" name="rw_score" min="200" max="800" step="10" class="form-control" placeholder="740">
-          </div>
-          <div class="col-6">
-            <label class="form-label">Math Score</label>
-            <input type="number" name="math_score" min="200" max="800" step="10" class="form-control" placeholder="780">
-          </div>
-          <div class="col-6">
-            <label class="form-label">R&W Incorrect</label>
-            <input type="number" name="rw_incorrect" min="0" max="54" class="form-control" placeholder="e.g., 6">
-          </div>
-          <div class="col-6">
-            <label class="form-label">Math Incorrect</label>
-            <input type="number" name="math_incorrect" min="0" max="44" class="form-control" placeholder="e.g., 8">
-          </div>
-          <div class="col-12">
-            <button class="btn btn-outline-secondary" type="submit">Save diagnosis</button>
-          </div>
+          <div class="col-6"><label class="form-label">R&W Score</label><input type="number" name="rw_score" min="200" max="800" step="10" class="form-control" placeholder="740"></div>
+          <div class="col-6"><label class="form-label">Math Score</label><input type="number" name="math_score" min="200" max="800" step="10" class="form-control" placeholder="780"></div>
+          <div class="col-6"><label class="form-label">R&W Incorrect</label><input type="number" name="rw_incorrect" min="0" max="54" class="form-control" placeholder="e.g., 6"></div>
+          <div class="col-6"><label class="form-label">Math Incorrect</label><input type="number" name="math_incorrect" min="0" max="44" class="form-control" placeholder="e.g., 8"></div>
+          <div class="col-12"><button class="btn btn-outline-secondary" type="submit">Save diagnosis</button></div>
         </form>
       </div>
     </div>
@@ -634,14 +313,8 @@ TEMPLATES["recommend.html"] = r"""
     if (ctx) {
       new Chart(ctx, {
         type: 'bar',
-        data: {
-          labels: ['Reading & Writing', 'Math'],
-          datasets: [{
-            label: 'Incorrect',
-            data: [{{ analysis.rw_incorrect or 0 }}, {{ analysis.math_incorrect or 0 }}]
-          }]
-        },
-        options: { plugins: { legend: { display: false }}, scales: { y: { beginAtZero: true }}}
+        data: { labels: ['Reading & Writing', 'Math'], datasets: [{ label: 'Incorrect', data: [{{ analysis.rw_incorrect or 0 }}, {{ analysis.math_incorrect or 0 }}] }] },
+        options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
       });
     }
   </script>
@@ -682,7 +355,7 @@ TEMPLATES["questions.html"] = r"""
         <ul class="small text-secondary mb-0">
           <li>CSV columns are flexible — we map common headings automatically.</li>
           <li>Include a <em>domain</em> for better targeting (e.g., Advanced Math, Algebra, Craft and Structure).</li>
-          <li>If available, include an <em>explanation</em> column. The LLM uses your data first.</li>
+          <li>If available, include an <em>explanation</em> column. Wrong answers will show it automatically.</li>
         </ul>
       </div>
     </div>
@@ -695,109 +368,48 @@ TEMPLATES["quiz.html"] = r"""
 {% block content %}
   <div class="d-flex align-items-center justify-content-between mb-4">
     <h4 class="fw-bold mb-0"><i class="bi bi-puzzle me-2"></i>Targeted Practice</h4>
-    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('recommend') }}">
-      <i class="bi bi-arrow-left me-1"></i>Back to recommendations
-    </a>
+    <a class="btn btn-outline-secondary btn-sm" href="{{ url_for('recommend') }}"><i class="bi bi-arrow-left me-1"></i>Back to recommendations</a>
   </div>
-  
   {% if not quiz %}
-    <div class="alert alert-warning">
-      <i class="bi bi-exclamation-triangle me-2"></i>
-      No quiz loaded. Start one from the recommendations page.
-    </div>
+    <div class="alert alert-warning"><i class="bi bi-exclamation-triangle me-2"></i>No quiz loaded. Start one from the recommendations page.</div>
   {% else %}
-    <div class="card">
-      <div class="card-body p-4">
-        <!-- Progress and metadata -->
-        <div class="d-flex justify-content-between align-items-center mb-4">
-          <div class="d-flex align-items-center gap-3">
-            <span class="badge bg-primary fs-6">Question {{ idx+1 }} of {{ total }}</span>
-            <span class="badge badge-soft">{{ q.domain or 'General' }}</span>
-          </div>
-          <div class="progress" style="width: 200px;">
-            <div class="progress-bar" role="progressbar" style="width: {{ ((idx+1)/total*100)|round }}%"></div>
-          </div>
+    <div class="card"><div class="card-body p-4">
+      <div class="d-flex justify-content-between align-items-center mb-4">
+        <div class="d-flex align-items-center gap-3"><span class="badge bg-primary fs-6">Question {{ idx+1 }} of {{ total }}</span><span class="badge badge-soft">{{ q.domain or 'General' }}</span></div>
+        <div class="progress" style="width:200px"><div class="progress-bar" role="progressbar" style="width: {{ ((idx+1)/total*100)|round }}%"></div></div>
+      </div>
+      {% if q.paragraph %}
+      <div class="question-content mb-4"><h6 class="text-muted mb-2">Reading Passage:</h6><div class="fs-6">{{ q.paragraph|safe }}</div></div>
+      {% endif %}
+      <div class="question-content mb-4"><h5 class="mb-3">{{ q.prompt|safe }}</h5></div>
+      <form action="{{ url_for('submit_answer', qidx=idx) }}" method="post" id="quiz-form">
+        <div class="row g-2">
+          {% for letter, text in q.choices.items() %}
+          <div class="col-12"><div class="choice-option {% if user_answer == letter %}selected{% endif %}">
+            <div class="form-check">
+              <input class="form-check-input" type="radio" name="answer" id="opt{{ letter }}" value="{{ letter }}" {% if user_answer == letter %}checked{% endif %} required>
+              <label class="form-check-label w-100" for="opt{{ letter }}"><strong class="me-2">{{ letter }}.</strong>{{ text|safe }}</label>
+            </div>
+          </div></div>
+          {% endfor %}
         </div>
+        <div class="d-flex gap-2 mt-4"><button class="btn btn-brand btn-lg" type="submit"><i class="bi bi-check2-circle me-1"></i>Submit Answer</button></div>
+      </form>
 
-        <!-- Question content -->
-        {% if q.paragraph %}
-        <div class="question-content mb-4">
-          <h6 class="text-muted mb-2">Reading Passage:</h6>
-          <div class="fs-6">{{ q.paragraph|safe }}</div>
-        </div>
-        {% endif %}
-        
-        <div class="question-content mb-4">
-          <h5 class="mb-3">{{ q.prompt|safe }}</h5>
-        </div>
-
-        <!-- Answer choices -->
-        <form action="{{ url_for('submit_answer', qidx=idx) }}" method="post" id="quiz-form">
-          <div class="row g-2">
-            {% for letter, text in q.choices.items() %}
-              <div class="col-12">
-                <div class="choice-option {% if user_answer == letter %}selected{% endif %}">
-                  <div class="form-check">
-                    <input class="form-check-input" type="radio" name="answer" id="opt{{ letter }}" 
-                           value="{{ letter }}" {% if user_answer == letter %}checked{% endif %} required>
-                    <label class="form-check-label w-100" for="opt{{ letter }}">
-                      <strong class="me-2">{{ letter }}.</strong>{{ text|safe }}
-                    </label>
-                  </div>
-                </div>
-              </div>
-            {% endfor %}
-          </div>
-          
-          <div class="d-flex gap-2 mt-4">
-            <button class="btn btn-brand btn-lg" type="submit">
-              <i class="bi bi-check2-circle me-1"></i>Submit Answer
-            </button>
-          </div>
-        </form>
-
-        <!-- Results section -->
-        {% if result %}
-          <hr class="my-4">
-          {% if result == 'correct' %}
-            <div class="alert alert-success d-flex align-items-center">
-              <i class="bi bi-check2-circle fs-4 me-3"></i>
-              <div>
-                <strong>Excellent!</strong> You selected <strong>{{ user_answer }}</strong>, which is correct.
-              </div>
-            </div>
-            <div class="d-flex gap-2">
-              <a href="{{ url_for('next_question', qidx=idx) }}" class="btn btn-success btn-lg">
-                <i class="bi bi-arrow-right me-1"></i>Next Question
-              </a>
-            </div>
-          {% else %}
-            <div class="alert alert-danger d-flex align-items-center">
-              <i class="bi bi-x-circle fs-4 me-3"></i>
-              <div>
-                <strong>Not quite right.</strong> You selected <strong>{{ user_answer }}</strong>, 
-                but the correct answer is <strong>{{ q.answer_letter }}</strong>.
-              </div>
-            </div>
-            
-            <!-- Always show official explanation if available -->
-            {% if q.explanation %}
-              <div class="explanation-box mt-3">
-                <h6 class="fw-bold mb-3">
-                  <i class="bi bi-lightbulb me-2"></i>Official Explanation
-                </h6>
-                <div class="fs-6">{{ q.explanation|safe }}</div>
-              </div>
-            {% endif %}
-            
-            <div class="d-flex gap-2 mt-4">
-              <a href="{{ url_for('next_question', qidx=idx) }}" class="btn btn-primary btn-lg">
-                <i class="bi bi-arrow-right me-1"></i>Continue
-              </a>
-            </div>
+      {% if result %}
+        <hr class="my-4">
+        {% if result == 'correct' %}
+          <div class="alert alert-success d-flex align-items-center"><i class="bi bi-check2-circle fs-4 me-3"></i><div><strong>Excellent!</strong> You selected <strong>{{ user_answer }}</strong>, which is correct.</div></div>
+          <div class="d-flex gap-2"><a href="{{ url_for('next_question', qidx=idx) }}\" class=\"btn btn-success btn-lg\"><i class=\"bi bi-arrow-right me-1\"></i>Next Question</a></div>
+        {% else %}
+          <div class="alert alert-danger d-flex align-items-center"><i class="bi bi-x-circle fs-4 me-3"></i><div><strong>Not quite right.</strong> You selected <strong>{{ user_answer }}</strong>, but the correct answer is <strong>{{ q.answer_letter }}</strong>.</div></div>
+          {% if q.explanation %}
+            <div class="explanation-box mt-3"><h6 class="fw-bold mb-3"><i class="bi bi-lightbulb me-2"></i>Official Explanation</h6><div class="fs-6">{{ q.explanation|safe }}</div></div>
           {% endif %}
+          <div class="d-flex gap-2 mt-4"><a href="{{ url_for('next_question', qidx=idx) }}\" class=\"btn btn-primary btn-lg\"><i class=\"bi bi-arrow-right me-1\"></i>Continue</a></div>
         {% endif %}
-    </div>
+      {% endif %}
+    </div></div>
   {% endif %}
 {% endblock %}
 """
@@ -805,12 +417,12 @@ TEMPLATES["quiz.html"] = r"""
 app.jinja_loader = DictLoader(TEMPLATES)
 
 # ---------------------------
-# Data structures & helpers
+# Domains & helpers
 # ---------------------------
 DOMAINS_RW = [
     "Information and Ideas",
-    "Craft and Structure",
     "Expression of Ideas",
+    "Craft and Structure",
     "Standard English Conventions",
 ]
 DOMAINS_MATH = [
@@ -819,6 +431,7 @@ DOMAINS_MATH = [
     "Problem-Solving and Data Analysis",
     "Geometry and Trigonometry",
 ]
+ALL_DOMAINS = DOMAINS_RW + DOMAINS_MATH
 
 @dataclass
 class Question:
@@ -838,7 +451,6 @@ class QuestionBank:
 
     def load_csv(self, file_like) -> None:
         df = pd.read_csv(file_like)
-        # Normalize headers
         cols = {c.lower().strip(): c for c in df.columns}
         def first(*names):
             for n in names:
@@ -847,18 +459,12 @@ class QuestionBank:
             return None
         id_col = first('id')
         domain_col = first('domain')
-        paragraph_col = first('paragraph', 'passage')
-        prompt_col = first('prompt', 'question')
-        choices_cols = {
-            'A': first('choice_a', 'a'),
-            'B': first('choice_b', 'b'),
-            'C': first('choice_c', 'c'),
-            'D': first('choice_d', 'd'),
-        }
-        ans_letter_col = first('correct_answer_letter', 'correct_answer', 'answer_letter')
-        ans_text_col = first('correct_answer_text', 'answer_text')
-        expl_col = first('explanation', 'rationale')
-
+        paragraph_col = first('paragraph','passage')
+        prompt_col = first('prompt','question')
+        choices_cols = {'A': first('choice_a','a'), 'B': first('choice_b','b'), 'C': first('choice_c','c'), 'D': first('choice_d','d')}
+        ans_letter_col = first('correct_answer_letter','correct_answer','answer_letter')
+        ans_text_col = first('correct_answer_text','answer_text')
+        expl_col = first('explanation','rationale')
         questions: List[Question] = []
         for _, row in df.iterrows():
             qid = str(row[id_col]) if id_col and not pd.isna(row.get(id_col)) else str(len(questions)+1)
@@ -871,29 +477,15 @@ class QuestionBank:
                     choices[L] = str(row[c])
             ans_letter = None
             if ans_letter_col and not pd.isna(row.get(ans_letter_col)):
-                ans_letter = str(row[ans_letter_col]).strip().upper()
-                if len(ans_letter) > 1:
-                    ans_letter = ans_letter[:1]
+                ans_letter = str(row[ans_letter_col]).strip().upper()[:1]
             ans_text = None
             if ans_text_col and not pd.isna(row.get(ans_text_col)):
                 ans_text = str(row[ans_text_col]).strip()
             elif ans_letter and ans_letter in choices:
                 ans_text = choices.get(ans_letter)
             explanation = str(row[expl_col]).strip() if expl_col and not pd.isna(row.get(expl_col)) else None
-
             extra = {c: row[c] for c in df.columns if c not in {id_col, domain_col, paragraph_col, prompt_col, *[x for x in choices_cols.values() if x], ans_letter_col, ans_text_col, expl_col}}
-
-            questions.append(Question(
-                id=qid,
-                domain=domain,
-                paragraph=paragraph,
-                prompt=prompt,
-                choices=choices,
-                answer_letter=ans_letter,
-                answer_text=ans_text,
-                explanation=explanation,
-                extra=extra,
-            ))
+            questions.append(Question(qid, domain, paragraph, prompt, choices, ans_letter, ans_text, explanation, extra))
         self.questions = questions
 
     def pick(self, domains: List[str], n: int) -> List[Question]:
@@ -907,10 +499,7 @@ class QuestionBank:
         total = len(self.questions)
         by_domain: Dict[str, int] = {}
         for q in self.questions:
-            # Skip questions without a domain from per-domain counts
-            if not q.domain or not str(q.domain).strip():
-                continue
-            d = str(q.domain).strip()
+            d = q.domain or "(none)"
             by_domain[d] = by_domain.get(d, 0) + 1
         return {
             'total': total,
@@ -919,19 +508,14 @@ class QuestionBank:
         }
 
 QB = QuestionBank()
-
-# Preload a CSV if provided via env var
 if DEFAULT_QUESTIONS_CSV and os.path.exists(DEFAULT_QUESTIONS_CSV):
     with open(DEFAULT_QUESTIONS_CSV, 'r', encoding='utf-8') as f:
         QB.load_csv(f)
 
 # ---------------------------
-# PDF parsing & diagnosis
+# PDF text parsing & diagnosis (heuristic fallback)
 # ---------------------------
-
-SCORE_REPORT_MARKERS = [
-    r"TOTAL\s+SCORE", r"Reading\s+and\s+Writing", r"Math", r"Questions\s+Overview"
-]
+SCORE_REPORT_MARKERS = [r"TOTAL\s+SCORE", r"Reading\s+and\s+Writing", r"Math", r"Questions\s+Overview"]
 
 @dataclass
 class Diagnosis:
@@ -961,7 +545,6 @@ def looks_like_score_report(text: str) -> bool:
 
 
 def parse_score_report(text: str) -> Diagnosis:
-    # Try to extract key fields using regex heuristics
     def pick_int(patterns: List[str]) -> Optional[int]:
         for pat in patterns:
             m = re.search(pat, text, re.I)
@@ -971,218 +554,272 @@ def parse_score_report(text: str) -> Diagnosis:
                 except Exception:
                     continue
         return None
-
     total = pick_int([r"TOTAL\s*SCORE\D+(\d{3,4})"])
-    rw = pick_int([r"Reading\s*and\s*Writing\D+(\d{3})"]) or pick_int([r"Reading\s*&\s*Writing\D+(\d{3})"])
-    math = pick_int([r"Math\D+(\d{3})"])  # first math score occurrence
-
-    # incorrect counts (from sample structure)
-    rw_incorrect = pick_int([r"Reading\s*and\s*Writing\s*[\s\S]*?Incorrect\s*Answers:\s*(\d+)"])
-    math_incorrect = pick_int([r"Math\s*[\s\S]*?Incorrect\s*Answers:\s*(\d+)"])
-    # Fallback if the above phrasing differs
-    if rw_incorrect is None:
-        rw_incorrect = pick_int([r"Reading\s*and\s*Writing[\s\S]*?Incorrect:\s*(\d+)"])
-    if math_incorrect is None:
-        math_incorrect = pick_int([r"Math[\s\S]*?Incorrect:\s*(\d+)"])
-
-    rw_pct = int(round(((rw or 0) - 200) / 6)) if rw else 0  # crude 0–100 from 200–800
+    rw = pick_int([r"Reading\s*and\s*Writing\D+(\d{3})", r"Reading\s*&\s*Writing\D+(\d{3})"])
+    math = pick_int([r"Math\D+(\d{3})"])
+    rw_incorrect = pick_int([r"Reading\s*and\s*Writing[\s\S]*?Incorrect\s*Answers:\s*(\d+)", r"Reading\s*and\s*Writing[\s\S]*?Incorrect:\s*(\d+)"])
+    math_incorrect = pick_int([r"Math[\s\S]*?Incorrect\s*Answers:\s*(\d+)", r"Math[\s\S]*?Incorrect:\s*(\d+)"])
+    rw_pct = int(round(((rw or 0) - 200) / 6)) if rw else 0
     math_pct = int(round(((math or 0) - 200) / 6)) if math else 0
+    # Basic focus guess if nothing else is available
+    rw_err = rw_incorrect or 0
+    math_err = math_incorrect or 0
+    focus = ["Craft and Structure", "Standard English Conventions"] if rw_err >= math_err else ["Advanced Math", "Algebra"]
+    return Diagnosis(total, rw, math, rw_incorrect, math_incorrect, rw_pct, math_pct, focus)
 
-    # Decide focus domains from section with higher error rate
-    # If counts missing, infer from relative scores
-    rw_err = rw_incorrect if rw_incorrect is not None else (54 - int(((rw or 500) - 200) * 54 / 600))
-    math_err = math_incorrect if math_incorrect is not None else (44 - int(((math or 500) - 200) * 44 / 600))
+# ---------------------------
+# Vision-based domain detector (from detect_empty_categories.py)
+# ---------------------------
 
-    # Enhanced domain analysis for SAT score reports
-    focus: List[str] = []
-    
-    # Define all 8 SAT content domains with their typical question ranges
-    domain_info = {
-        # Reading & Writing domains
-        "Information and Ideas": {"section": "rw", "typical_questions": 12},
-        "Expression of Ideas": {"section": "rw", "typical_questions": 8}, 
-        "Craft and Structure": {"section": "rw", "typical_questions": 13},
-        "Standard English Conventions": {"section": "rw", "typical_questions": 11},
-        # Math domains
-        "Algebra": {"section": "math", "typical_questions": 13},
-        "Advanced Math": {"section": "math", "typical_questions": 13},
-        "Problem-Solving and Data Analysis": {"section": "math", "typical_questions": 5},
-        "Geometry and Trigonometry": {"section": "math", "typical_questions": 5}
+def load_params() -> dict:
+    defaults = {
+        "threshold": "100",  # or "otsu"
+        "morph_size": 3,
+        "erosion": 2,
+        # crop percents for the Knowledge & Skills block
+        "crop_x1": 0.45,
+        "crop_x2": 1.00,
+        "crop_y1": 0.25,
+        "crop_y2": 0.80,
     }
-    
-    # Analyze domain performance by looking for specific patterns
-    domain_weaknesses = []
-    
-    # Method 1: Look for domains mentioned in context of low performance
-    weakness_indicators = [
-        r"need\s+to\s+focus\s+on",
-        r"areas?\s+for\s+improvement",
-        r"consider\s+reviewing",
-        r"practice\s+more",
-        r"strengthen\s+your"
-    ]
-    
-    for domain in domain_info.keys():
-        domain_text_pattern = re.escape(domain)
-        # Look for weakness indicators near domain mentions
-        for indicator in weakness_indicators:
-            pattern = f"({indicator}.{{0,50}}{domain_text_pattern}|{domain_text_pattern}.{{0,50}}{indicator})"
-            if re.search(pattern, text, re.I):
-                domain_weaknesses.append(domain)
-                break
-    
-    # Method 2: Advanced pattern analysis for domain-specific performance
-    if not domain_weaknesses:
-        # Try to extract domain-specific performance from visual patterns in text
-        # Look for patterns that might indicate unfilled boxes or poor performance
-        
-        # Check for specific domain performance indicators
-        domain_performance = {}
-        
-        for domain in domain_info.keys():
-            domain_score = 1.0  # Start with perfect score
-            
-            # Look for the domain section in the text
-            domain_pattern = re.escape(domain) + r'\s*\([^)]*\)'
-            match = re.search(domain_pattern, text, re.I)
-            
-            if match:
-                # Get the text section after this domain (next ~300 chars)
-                start_pos = match.end()
-                domain_section = text[start_pos:start_pos + 300]
-                
-                # Look for visual indicators that might suggest poor performance
-                # Count potential "empty box" indicators or spacing patterns
-                empty_indicators = len(re.findall(r'\s{3,}|\t+|□|○|◯', domain_section))
-                filled_indicators = len(re.findall(r'■|●|◆|▪', domain_section))
-                
-                # Heuristic: if we see spacing patterns that might indicate empty boxes
-                if empty_indicators > 0:
-                    domain_score = max(0.1, 1.0 - (empty_indicators * 0.3))
-                
-                domain_performance[domain] = domain_score
-        
-        # If we have performance data, identify the weakest domains
-        if domain_performance:
-            # Sort domains by performance (lowest first)
-            sorted_domains = sorted(domain_performance.items(), key=lambda x: x[1])
-            # Take the 2 weakest domains
-            domain_weaknesses = [domain for domain, score in sorted_domains[:2] if score < 0.8]
-        
-        # Smart fallback based on common SAT performance patterns
-        if not domain_weaknesses:
-            # Based on your specific case: 3 errors in RW, 3 errors in Math
-            # From the visual: Expression of Ideas and Geometry & Trigonometry have unfilled boxes
-            
-            if (rw_err or 0) > 0 and (math_err or 0) > 0:
-                # Both sections have errors
-                if abs((rw_err or 0) - (math_err or 0)) <= 1:
-                    # Balanced errors - focus on domains that commonly have issues
-                    # Expression of Ideas (smaller domain, easier to improve)
-                    # Geometry and Trigonometry (smaller domain, specific skill set)
-                    domain_weaknesses = ["Expression of Ideas", "Geometry and Trigonometry"]
-                elif rw_err > math_err:
-                    # More RW errors - focus on RW domains
-                    domain_weaknesses = ["Expression of Ideas", "Standard English Conventions"]
-                else:
-                    # More Math errors - focus on Math domains  
-                    domain_weaknesses = ["Geometry and Trigonometry", "Problem-Solving and Data Analysis"]
-            elif (rw_err or 0) > 0:
-                # Only RW has errors - focus on commonly problematic RW domains
-                domain_weaknesses = ["Expression of Ideas", "Standard English Conventions"]
-            elif (math_err or 0) > 0:
-                # Only Math has errors - focus on commonly problematic Math domains
-                domain_weaknesses = ["Geometry and Trigonometry", "Problem-Solving and Data Analysis"]
-    
-    # Method 3: Look for all domain mentions and prioritize by section weakness
-    if not domain_weaknesses:
-        found_domains = []
-        for domain in domain_info.keys():
-            if re.search(re.escape(domain), text, re.I):
-                found_domains.append(domain)
-        
-        if found_domains:
-            # Prioritize domains from the weaker section
-            if (rw_err or 0) >= (math_err or 0):
-                rw_domains = [d for d in found_domains if domain_info[d]["section"] == "rw"]
-                domain_weaknesses = rw_domains[:2] if rw_domains else found_domains[:2]
-            else:
-                math_domains = [d for d in found_domains if domain_info[d]["section"] == "math"]
-                domain_weaknesses = math_domains[:2] if math_domains else found_domains[:2]
-    
-    # Final fallback
-    if not domain_weaknesses:
-        if (rw_err or 0) >= (math_err or 0):
-            domain_weaknesses = ["Craft and Structure", "Standard English Conventions"]
-        else:
-            domain_weaknesses = ["Advanced Math", "Algebra"]
-    
-    # Limit to top 2 focus domains
-    focus = domain_weaknesses[:2]
-
-    return Diagnosis(
-        total_score=total,
-        rw_score=rw,
-        math_score=math,
-        rw_incorrect=rw_incorrect,
-        math_incorrect=math_incorrect,
-        rw_pct=rw_pct,
-        math_pct=math_pct,
-        focus_domains=focus,
-    )
-
-# ---------------------------
-# LLM helper (OpenAI optional)
-# ---------------------------
-
-# ---------------------------
-# Local Hugging Face LLM helper (≤3B params)
-# ---------------------------
-_HF_PIPELINE = None
-_HF_TOKENIZER = None
-
-
-def _load_hf_pipeline():
-    """Load a lightweight text-generation pipeline lazily once."""
-    global _HF_PIPELINE, _HF_TOKENIZER
-    if _HF_PIPELINE is not None:
-        return _HF_PIPELINE, _HF_TOKENIZER
+    if not os.path.exists(PARAMS_FILE):
+        return defaults
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
-        import torch
-        model_id = HF_MODEL_ID
-        tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-        kwargs = {}
-        if torch.cuda.is_available():
-            kwargs.update({"torch_dtype": torch.float16, "device_map": "auto"})
-        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            kwargs.update({"torch_dtype": torch.float16, "device_map": "auto"})
-        else:
-            kwargs.update({"torch_dtype": torch.float32, "device_map": "cpu"})
-        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-        _HF_PIPELINE = pipeline("text-generation", model=model, tokenizer=tok)
-        _HF_TOKENIZER = tok
-        return _HF_PIPELINE, _HF_TOKENIZER
-    except Exception as e:
-        app.logger.warning(f"HF model load failed: {e}")
-        _HF_PIPELINE = None
-        _HF_TOKENIZER = None
-        return None, None
+        with open(PARAMS_FILE) as f:
+            data = json.load(f)
+        for k, v in defaults.items():
+            data.setdefault(k, v)
+        return data
+    except Exception:
+        return defaults
 
 
-# LLM functionality removed - always show official explanations instead
+def pdf_pages_to_images(pdf_path: str, dpi: int = 350) -> List[np.ndarray]:
+    doc = fitz.open(pdf_path)
+    zoom = dpi / 72.0
+    mat = fitz.Matrix(zoom, zoom)
+    pages = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        pages.append(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
+    return pages
+
+
+def crop_region(img: np.ndarray, cx1: float, cx2: float, cy1: float, cy2: float) -> np.ndarray:
+    if img.size == 0:
+        return img
+    h, w = img.shape[:2]
+    if cx1 > cx2: cx1, cx2 = cx2, cx1
+    if cy1 > cy2: cy1, cy2 = cy2, cy1
+    x1 = max(0, min(w - 1, int(round(w * cx1))))
+    x2 = max(0, min(w,     int(round(w * cx2))))
+    y1 = max(0, min(h - 1, int(round(h * cy1))))
+    y2 = max(0, min(h,     int(round(h * cy2))))
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros((1,1,3), dtype=np.uint8)
+    return img[y1:y2, x1:x2]
+
+
+def half_split(img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if img.size == 0 or img.shape[1] == 0:
+        return img, img
+    h, w = img.shape[:2]
+    mid = w // 2
+    return img[:, :mid], img[:, mid:]
+
+
+def _detect_boxes(img: np.ndarray, threshold: str, morph_size: int, erosion: int) -> Tuple[List[Tuple[int,int,int,int]], np.ndarray]:
+    if img.size == 0 or img.shape[1] == 0 or img.shape[0] == 0:
+        return [], np.zeros((1,1,3), dtype=np.uint8)
+    target_w = 900
+    scale = target_w / float(img.shape[1])
+    scaled = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+    gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    if str(threshold).lower() == "otsu":
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    else:
+        tval = max(0, min(255, int(float(threshold))))
+        _, th = cv2.threshold(gray, tval, 255, cv2.THRESH_BINARY_INV)
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_size, morph_size))
+    opened = cv2.morphologyEx(th, cv2.MORPH_OPEN, k, iterations=1)
+    proc = cv2.erode(opened, k, iterations=max(0, int(erosion)))
+    cnts, _ = cv2.findContours(proc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: List[Tuple[int,int,int,int]] = []
+    H = scaled.shape[0]
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        area = w * h
+        if 30 <= area <= 7000:
+            ar = w / float(h + 1e-6)
+            if 0.3 <= ar <= 7.0 and h <= H * 0.18:
+                boxes.append((x, y, w, h))
+    boxes.sort(key=lambda b: (b[1], b[0]))
+    return boxes, scaled
+
+
+def _group_boxes_into_rows(boxes: List[Tuple[int,int,int,int]], y_tol: int = 14) -> List[Dict]:
+    rows: List[Dict] = []
+    for (x, y, w, h) in boxes:
+        cy = y + h / 2.0
+        placed = False
+        for row in rows:
+            if abs(cy - row["cy"]) <= y_tol:
+                row["boxes"].append((x, y, w, h))
+                row["cy"] = float(np.mean([b[1] + b[3]/2.0 for b in row["boxes"]]))
+                placed = True
+                break
+        if not placed:
+            rows.append({"cy": cy, "boxes": [(x, y, w, h)]})
+    for r in rows:
+        r["boxes"].sort(key=lambda b: b[0])
+    rows.sort(key=lambda r: r["cy"])
+    return rows
+
+
+def _ocr_words(image: np.ndarray) -> List[dict]:
+    try:
+        data = pytesseract.image_to_data(image, output_type=Output.DICT)
+    except Exception:
+        return []
+    words = []
+    n = len(data.get("text", []))
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        conf_raw = str(data.get("conf", ["-1"][0])[i])
+        try:
+            conf = int(conf_raw) if conf_raw.isdigit() else -1
+        except Exception:
+            conf = -1
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        words.append({"text": txt, "conf": conf, "bbox": (x, y, w, h)})
+    return words
+
+
+def _associate_rows_with_domains(rows: List[Dict], ocr: List[dict], domain_list: List[str]) -> Dict[str, List[Tuple[int,int,int,int]]]:
+    assoc: Dict[str, List[Tuple[int,int,int,int]]] = {}
+    used = set()
+    def find_y_for_phrase(phrase: str) -> Optional[int]:
+        parts = phrase.split()
+        n = len(parts)
+        best_y, best_conf = None, -1
+        for i in range(len(ocr) - n + 1):
+            seq = [ocr[i+j]["text"].lower() for j in range(n)]
+            if seq == [p.lower() for p in parts]:
+                conf_vals = [ocr[i+j]["conf"] for j in range(n) if ocr[i+j]["conf"] >= 0]
+                conf = int(np.mean(conf_vals)) if conf_vals else 0
+                y = ocr[i]["bbox"][1]
+                if conf > best_conf:
+                    best_conf, best_y = conf, y
+        return best_y
+    domain_y = {d: find_y_for_phrase(d) for d in domain_list}
+    for d, ly in domain_y.items():
+        if ly is None:
+            continue
+        best_row, best_dist = None, 1e9
+        for idx, r in enumerate(rows):
+            if idx in used:
+                continue
+            dist = abs(r["cy"] - ly)
+            if dist < best_dist:
+                best_dist, best_row = dist, idx
+        if best_row is not None:
+            assoc[d] = rows[best_row]["boxes"]
+            used.add(best_row)
+    remaining_rows = [rows[i] for i in range(len(rows)) if i not in used]
+    remaining_domains = [d for d in domain_list if d not in assoc]
+    for d, r in zip(remaining_domains, remaining_rows):
+        assoc[d] = r["boxes"]
+    for d in domain_list:
+        assoc.setdefault(d, [])
+    return assoc
+
+@dataclass
+class DomainResult:
+    filled: int
+    total: int
+    empty: int
+
+
+def infer_domain_results_for_half(half_img: np.ndarray, params: dict, domain_list: List[str]) -> Tuple[Dict[str, DomainResult], int]:
+    boxes, scaled = _detect_boxes(half_img, params["threshold"], params["morph_size"], params["erosion"])
+    rows = _group_boxes_into_rows(boxes, y_tol=14)
+    ocr = _ocr_words(scaled)
+    assoc = _associate_rows_with_domains(rows, ocr, domain_list)
+    results: Dict[str, DomainResult] = {}
+    for dom in domain_list:
+        dom_boxes = assoc.get(dom, [])
+        filled = 0
+        for (x, y, w, h) in dom_boxes:
+            crop = scaled[y:y+h, x:x+w]
+            if crop.size == 0:
+                continue
+            mean_val = float(np.mean(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)))
+            if mean_val < 140:  # dark = filled
+                filled += 1
+        total_expected = EXPECTED_PER_DOMAIN
+        empty = max(0, total_expected - filled)
+        results[dom] = DomainResult(filled=filled, total=total_expected, empty=empty)
+    return results, len(boxes)
+
+
+def detect_empty_categories(pdf_path: str, page_index: int = 0, dpi: int = 350) -> Dict[str, int]:
+    params = load_params()
+    pages = pdf_pages_to_images(pdf_path, dpi=dpi)
+    if not pages:
+        return {}
+    page = pages[min(page_index, len(pages) - 1)]
+    region = crop_region(page, params["crop_x1"], params["crop_x2"], params["crop_y1"], params["crop_y2"])
+    left, right = half_split(region)
+    rw_res, _ = infer_domain_results_for_half(left, params, DOMAINS_RW)
+    m_res, _  = infer_domain_results_for_half(right, params, DOMAINS_MATH)
+    all_results: Dict[str, DomainResult] = {**rw_res, **m_res}
+    empties = {cat: dr.empty for cat, dr in all_results.items() if dr.empty > 0}
+    return dict(sorted(empties.items(), key=lambda kv: kv[1], reverse=True))
 
 # ---------------------------
 # Flask routes
 # ---------------------------
 
+# CORS for local Next.js dev (optional)
+@app.after_request
+def add_cors_headers(resp):
+    origin = request.headers.get('Origin')
+    if origin in ("http://localhost:3000", "http://127.0.0.1:3000"):
+        resp.headers['Access-Control-Allow-Origin'] = origin
+        resp.headers['Vary'] = 'Origin'
+        resp.headers['Access-Control-Allow-Credentials'] = 'true'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    return resp
+
+@app.route('/api/<path:path>', methods=['OPTIONS'])
+def api_options(path: str):
+    return ('', 204)
+
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    return jsonify({'ok': True, 'message': 'OpenSAT Coach backend ready', 'questions_loaded': len(QB.questions), 'max_quiz_questions': MAX_QUIZ_QUESTIONS})
+
+@app.before_request
+def maybe_autoload_local_csv():
+    if not QB.questions:
+        for candidate in ["questions.csv", os.path.join("data", "questions.csv"), "/mnt/data/questions.csv"]:
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, 'r', encoding='utf-8') as f:
+                        QB.load_csv(f)
+                        app.logger.info("Auto-loaded %s (%d questions)", candidate, len(QB.questions))
+                except Exception:
+                    pass
+                break
+
 @app.route("/")
 def home():
     analysis = session.get('analysis')
-    return render_template(
-        'home.html',
-        analysis=analysis,
-    )
+    return render_template('home.html', analysis=analysis)
 
 @app.route("/upload-pdf", methods=["POST"])
 def upload_pdf():
@@ -1192,18 +829,56 @@ def upload_pdf():
         return redirect(url_for('home'))
     path = os.path.join(UPLOAD_DIR, f.filename)
     f.save(path)
-    text = extract_text_from_pdf(path)
-    if not text.strip():
-        flash("Could not read text from PDF. Try another file or enter scores manually.")
-        return redirect(url_for('home'))
-    if looks_like_score_report(text):
-        diag = parse_score_report(text)
-    else:
-        # Not a score report — ask user to enter scores
-        flash("This PDF doesn't look like a score report. Enter scores manually (right card).")
-        return redirect(url_for('home'))
 
-    session['analysis'] = diag.__dict__
+    # Try vision-based domain analysis first
+    focus_domains: List[str] = []
+    rw_incorrect = None
+    math_incorrect = None
+    rw_score = None
+    math_score = None
+
+    try:
+        empties = detect_empty_categories(path)
+        if empties:
+            # Choose up to 2 domains with the most empties
+            focus_domains = [d for d, _ in list(empties.items())[:2]]
+    except Exception as e:
+        app.logger.warning(f"Vision detection failed: {e}")
+
+    # Also try to parse textual scores as a supplement/fallback
+    try:
+        text = extract_text_from_pdf(path)
+        if text.strip() and looks_like_score_report(text):
+            diag = parse_score_report(text)
+            rw_score = diag.rw_score
+            math_score = diag.math_score
+            rw_incorrect = diag.rw_incorrect
+            math_incorrect = diag.math_incorrect
+            # if focus from vision empty, borrow text-based focus
+            if not focus_domains:
+                focus_domains = diag.focus_domains
+        else:
+            if not focus_domains:
+                focus_domains = ["Craft and Structure", "Standard English Conventions"]
+    except Exception as e:
+        app.logger.warning(f"Text parse failed: {e}")
+        if not focus_domains:
+            focus_domains = ["Craft and Structure", "Standard English Conventions"]
+
+    # Compute simple progress bars from scores if present
+    rw_pct = int(round(((rw_score or 0) - 200) / 6)) if rw_score else 0
+    math_pct = int(round(((math_score or 0) - 200) / 6)) if math_score else 0
+
+    session['analysis'] = {
+        'total_score': None,
+        'rw_score': rw_score,
+        'math_score': math_score,
+        'rw_incorrect': rw_incorrect,
+        'math_incorrect': math_incorrect,
+        'rw_pct': rw_pct,
+        'math_pct': math_pct,
+        'focus_domains': focus_domains,
+    }
     flash("Analysis saved. See recommendations below.")
     return redirect(url_for('recommend'))
 
@@ -1219,25 +894,21 @@ def manual_scores():
     math_score = val('math_score')
     rw_incorrect = val('rw_incorrect')
     math_incorrect = val('math_incorrect')
-
-    # Build a diagnosis with simple domain suggestion
     rw_pct = int(round(((rw_score or 0) - 200) / 6)) if rw_score else 0
     math_pct = int(round(((math_score or 0) - 200) / 6)) if math_score else 0
     rw_err = rw_incorrect or 0
     math_err = math_incorrect or 0
     focus = ["Craft and Structure", "Standard English Conventions"] if rw_err >= math_err else ["Advanced Math", "Algebra"]
-
-    diag = Diagnosis(
-        total_score=None,
-        rw_score=rw_score,
-        math_score=math_score,
-        rw_incorrect=rw_incorrect,
-        math_incorrect=math_incorrect,
-        rw_pct=rw_pct,
-        math_pct=math_pct,
-        focus_domains=focus,
-    )
-    session['analysis'] = diag.__dict__
+    session['analysis'] = {
+        'total_score': None,
+        'rw_score': rw_score,
+        'math_score': math_score,
+        'rw_incorrect': rw_incorrect,
+        'math_incorrect': math_incorrect,
+        'rw_pct': rw_pct,
+        'math_pct': math_pct,
+        'focus_domains': focus,
+    }
     flash("Manual analysis saved.")
     return redirect(url_for('recommend'))
 
@@ -1282,9 +953,7 @@ def start_quiz():
         'qids': [q.id for q in questions],
         'answers': [None]*len(questions),
         'results': [None]*len(questions),  # 'correct' / 'wrong'
-        # explanations removed - using official explanations only
     }
-    # Store only the quiz metadata in session (not the full question data)
     session['quiz'] = quiz
     return redirect(url_for('show_question', qidx=0))
 
@@ -1331,8 +1000,6 @@ def submit_answer(qidx: int):
     session['quiz'] = quiz
     return redirect(url_for('show_question', qidx=qidx))
 
-# teach_me route removed - official explanations are now always shown
-
 @app.route("/quiz/<int:qidx>/next")
 def next_question(qidx: int):
     quiz = session.get('quiz')
@@ -1351,25 +1018,7 @@ app.add_url_rule('/upload_pdf', 'upload_pdf', upload_pdf, methods=['POST'])
 app.add_url_rule('/manual_scores', 'manual_scores', manual_scores, methods=['POST'])
 app.add_url_rule('/upload_questions', 'upload_questions', upload_questions, methods=['POST'])
 app.add_url_rule('/submit/<int:qidx>', 'submit_answer', submit_answer, methods=['POST'])
-# teach_me route removed
 app.add_url_rule('/next/<int:qidx>', 'next_question', next_question)
-
-# ---------------------------
-# Dev convenience: load CSV from disk if present in project folder
-# ---------------------------
-@app.before_request
-def maybe_autoload_local_csv():
-    # If the bank is empty and a local questions.csv exists, load it once.
-    if not QB.questions:
-        for candidate in ["questions.csv", os.path.join("data", "questions.csv"), "/mnt/data/questions.csv"]:
-            if os.path.exists(candidate):
-                try:
-                    with open(candidate, 'r', encoding='utf-8') as f:
-                        QB.load_csv(f)
-                        app.logger.info("Auto-loaded %s (%d questions)", candidate, len(QB.questions))
-                except Exception:
-                    pass
-                break
 
 if __name__ == "__main__":
     app.run(debug=True)
